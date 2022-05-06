@@ -1,0 +1,916 @@
+---
+title: "DATA 615 - Group Project Report"
+author: "Binh Minh An Nguyen, Concillia Mpofu"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Load dataset & required packages
+
+```{r}
+library(tidyverse)
+library(broom)
+library(maps)
+library(rvest)
+library(geosphere)
+```
+
+```{r}
+ecotour_raw <- read_csv("./data/Train.csv")
+```
+
+
+## Data ETL
+
+1. First, we will cleanup our data by recoding some variables in order to make them in the right format and easier to read.
+
+```{r}
+ecotour <- ecotour_raw %>% 
+  mutate(
+    age = case_when(age_group == "24-Jan" ~ "Youth",
+                    age_group == "25-44" ~ "Early Adult",
+                    age_group == "44-64" ~ "Late Adult",
+                    TRUE ~ "Senior"),
+    age = as.factor(age),
+    travel_with = case_when(
+      travel_with %in% c("Spouse", "Spouse and Children", "Children") ~ "Family",
+      travel_with %in% c("Alone", "Friends/Relatives") ~ travel_with,
+      TRUE ~ "Others"),
+    travel_with = as.factor(travel_with),
+    main_activity = case_when(
+      main_activity %in% c("Bird watching","Wildlife tourism") ~ "Wildlife tourism",
+      main_activity %in% c("Beach tourism", "Diving and Sport Fishing") ~ "Beach tourism",
+      main_activity %in% c("business", "Conference tourism") ~ "Business tour",
+      TRUE ~ main_activity),
+    main_activity = as.factor(main_activity),
+    info_source = case_when(
+      info_source %in% c("inflight magazines", "Newspaper, magazines,brochures") ~ "Trad.Marketing",
+      info_source == "Radio, TV, Web" ~ "Digital.Marketing",
+      info_source == "Travel, agent, tour operator" ~ "Agent",
+      info_source == "Tanzania Mission Abroad" ~ "Diploma",
+      info_source == "Friends, relatives" ~ "Referral",
+      TRUE ~ info_source),
+    info_source = as.factor(info_source),
+    by_tour = case_when(tour_arrangement == "Independent" ~ 0,
+                        TRUE ~ 1),
+    by_tour = as.factor(by_tour),
+    across(
+      c(package_accomodation, package_transport_int, package_food, package_guided_tour, package_insurance, package_sightseeing, package_transport_tz, first_trip_tz), 
+      as.factor),
+    payment_mode = case_when(
+      payment_mode %in% c("Travellers Cheque", "Other") ~ "Others",
+      TRUE ~ payment_mode),
+    payment_mode = as.factor(payment_mode)
+  ) %>% 
+  dplyr::select(-c(age_group, tour_arrangement, most_impressing))
+```
+
+2. Since our dataset has more categorical variables than quantitative variables, we realize that the location variable **country** can be transformed into distance.
+
+In order to do such transformation, we will use an Open Data by Google to estimate the distance between different countries based on the country's centroid. So, let's load the Open Data:
+
+```{r}
+url <- 'https://developers.google.com/public-data/docs/canonical/countries_csv'
+webpage <- read_html(url)
+centroids <- url %>% 
+  read_html %>% 
+  html_nodes('table') %>% 
+  html_table() %>% 
+  as.data.frame()
+centroids <- rename(centroids, region = name)
+```
+
+While checking through the original dataset, we spotted some countries were given incorrect name. Thus, we revise countries' names as below:
+
+```{r}
+# Rename column `country` as `region`
+ecotour$country <- str_to_title(ecotour$country)
+ecotour <- rename(ecotour, region = country)
+
+# Revise countries' names
+ecotour %>% 
+  mutate(
+    region = case_when(
+      region == "Swizerland" ~ "Switzerland",
+      region == "United States Of America" ~ "United States",
+      region == "Uae" ~ "United Arab Emirates",
+      region == "Malt" ~ "Malta",
+      region == "Myanmar" ~ "Myanmar [Burma]",
+      region == "Congo" ~ "Congo [Republic]",
+      region == "Burgaria" ~ "Bulgaria",
+      region == "Drc" ~ "Congo [DRC]",
+      region == "Ukrain" ~ "Ukraine",
+      region == "Trinidad Tobacco" ~ "Trinidad and Tobago",
+      region == "Comoro" ~ "Comoros",
+      region == "Costarica" ~ "Costa Rica",
+      region == "Philipines" ~ "Philippines",
+      region == "Ivory Coast" ~ "Côte d'Ivoire",
+      region == "Djibout" ~ "Djibouti",
+      region == "Morroco" ~ "Morocco",
+      TRUE ~ region)) -> ecotour
+```
+
+Next, we have found out the geographic location of Tazania based on its Longitude and Latitude is as below:
+
+```{r}
+tanzania_centre <- c(34.8888,-6.3690)
+```
+
+Now, let's calculate the distances to Tanzania:
+
+```{r}
+ecotour %>% 
+  left_join(centroids, by = "region") %>% 
+  rowwise() %>%
+  mutate(
+    distancetoTanzania = distHaversine(c(longitude, latitude), tanzania_centre)/1000) -> eco_join
+
+eco_join <- eco_join[ , ! names(eco_join) %in% c("country")] 
+```
+
+## Preliminary Analysis
+
+Since our outcome variable is a quantitative variable, our target is to find out the most suitable multiple linear regression model to address our question of interest.
+
+The data type for our variables are as below:
+
+  * Quantitative variables: total_cost, distancetoTanzania, total_female, total_male, night_mainland, night_zanzibar
+  * Categorical/factor variables: travel_with, purpose, main_activity, info_source, package_transport_int, package_accommodation, package_food, package_transport_tz, package_sightseeing, package_guided_tour, package_insurance, payment_mode, first_trip_tz, age, by_tour 
+
+Other variables, such as longitude, latitude, region, and ID will not be used for modeling and analysis.
+
+### Inspect the relationship between predictor variables and outcome variable
+
+Firstly, let's check the distribution of our outcome variable. In general, but not always, if the outcome variable is not normally distributed, the residuals term won't be either.
+
+```{r}
+hist(eco_join$total_cost)
+```
+
+**Analysis**: The outcome is extremely right-skewed with outliers at the right tail, at which total costs are very high.
+
+Since we have 5 predictor variables are quantitative and the rest are categorical variables, we will use a correlation matrix and conduct ANOVA test to inspect the potential relationship between the raw outcome variable **total_cost** and predictor variables.
+
+**1. Correlation Matrix**
+
+```{r}
+# Subset only quantitative variables
+eco_num <- eco_join %>% 
+  dplyr::select(total_cost, total_female, total_male, night_mainland, night_zanzibar, distancetoTanzania) %>% 
+  drop_na()
+
+# Correlogram
+pairs(eco_num, main = "Correlogram")
+
+# Correlation Matrix
+eco_corr <- cor(eco_num)
+corrplot::corrplot(eco_corr, order = "hclust", method = "number")
+```
+
+
+**2. ANOVA Test**
+
+We will use boxplot for visualization and conduct ANOVA test between the outcome variable **total_cost** and the categorical predictor variable.
+
+```{r}
+# Boxplot
+boxplot(total_cost~age, data = eco_join)
+boxplot(total_cost~travel_with, data = eco_join)
+boxplot(total_cost~purpose, data = eco_join)
+boxplot(total_cost~main_activity, data = eco_join)
+boxplot(total_cost~info_source, data = eco_join)
+boxplot(total_cost~package_transport_int, data = eco_join)
+boxplot(total_cost~package_transport_tz, data = eco_join)
+boxplot(total_cost~package_accomodation, data = eco_join)
+boxplot(total_cost~package_food, data = eco_join)
+boxplot(total_cost~package_sightseeing, data = eco_join)
+boxplot(total_cost~package_guided_tour, data = eco_join)
+boxplot(total_cost~package_insurance, data = eco_join)
+boxplot(total_cost~payment_mode, data = eco_join)
+boxplot(total_cost~first_trip_tz, data = eco_join)
+boxplot(total_cost~by_tour, data = eco_join)
+```
+
+```{r}
+# ANOVA tests
+summary(aov(total_cost~age, eco_join))
+summary(aov(total_cost~travel_with, eco_join))
+summary(aov(total_cost~purpose, eco_join))
+summary(aov(total_cost~main_activity, eco_join))
+summary(aov(total_cost~info_source, eco_join))
+summary(aov(total_cost~package_transport_int, eco_join))
+summary(aov(total_cost~package_transport_tz, eco_join))
+summary(aov(total_cost~package_accomodation, eco_join))
+summary(aov(total_cost~package_food, eco_join))
+summary(aov(total_cost~package_sightseeing, eco_join))
+summary(aov(total_cost~package_guided_tour, eco_join))
+summary(aov(total_cost~package_insurance, eco_join))
+summary(aov(total_cost~payment_mode, eco_join))
+summary(aov(total_cost~first_trip_tz, eco_join))
+summary(aov(total_cost~by_tour, eco_join))
+```
+**Analysis**:
+
+Based on the correlogram and correlation matrix, we could see that without any transformation, the outcome variable barely holds any clear linear relationship with the quantitative predictors. While the quantitative predictors are not significantly correlated to each other either.
+
+On the other hand, the ANOVA test shows that most of the categorical predictors are significantly contributed to the outcome variable total_cost, as we assess each variable independently. Nevertheless, in the next step, we will further examine if these categorical variables are independent from each other by using Chi-square test. 
+
+### Chi-square Test
+
+1. Select categorical variables only
+
+```{r}
+eco_join <- eco_join %>% 
+  dplyr::select(-c(longitude, latitude, region, ID))
+
+eco_chi <- eco_join %>% 
+  dplyr::select(travel_with, main_activity, info_source, package_transport_int, package_accomodation, package_transport_tz, package_food, package_guided_tour, package_insurance, package_sightseeing, payment_mode, first_trip_tz, age, by_tour)
+```
+
+2. Chi-square test between Travel_with and other categorical variables
+
+```{r, message=FALSE}
+CHIS <- lapply(eco_chi[,-1], function(x) chisq.test(eco_chi[,1], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+3. 
+
+
+```{r}
+CHIS <- lapply(eco_chi[,-2], function(x) chisq.test(eco_chi[,2], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+3. Information source vs others
+
+```{r}
+CHIS <- lapply(eco_chi[,-3], function(x) chisq.test(eco_chi[,3], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+
+4. International transport vs others
+
+```{r}
+CHIS <- lapply(eco_chi[,-4], function(x) chisq.test(eco_chi[,4], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+5. Package_accommodation vs others
+
+```{r}
+CHIS <- lapply(eco_chi[,-5], function(x) chisq.test(eco_chi[,5], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+
+Not significant: {Package_accommodation, payment_mode}
+
+6. Domestic transport vs others
+
+Insignificant vs Payment mode
+
+```{r}
+CHIS <- lapply(eco_chi[,-6], function(x) chisq.test(eco_chi[,6], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+
+7. Age vs others
+
+```{r}
+CHIS <- lapply(eco_chi[,-13], function(x) chisq.test(eco_chi[,13], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+8. by_tour vs others
+
+Insignificant with payment mode
+
+```{r}
+CHIS <- lapply(eco_chi[,-14], function(x) chisq.test(eco_chi[,14], x))
+do.call(rbind, CHIS)[,c(1,3)]
+```
+
+**Analysis**
+
+Most of the predictor variables are significantly dependent on each other, except the payment_mode and single element within tour package. Such test results are understandable as the payment shall be made before hand - while a visitor decides the appropriate tour package.
+
+Nevertheless, the significant p-values from all Chi-square tests suggest that there are red flags of having severe multicollinearity in the Linear Regression model using full variables. We will further examine the multicollinearity issue by using Condition Index (CI) and Variance Inflation Factors (VIF) in the next steps upon fitting a regression model using Ordinary Least Squares method.
+
+### Outliers Analysis
+
+### Fit OLS Regression model with raw variables (not yet exclude outliers)
+
+```{r}
+ols_raw <- lm(total_cost~., data = eco_join)
+summary(ols_raw)
+plot(ols_raw)
+
+library(car)
+library(klaR)
+cond.index(ols_raw, data = eco_join)
+vif(ols_raw)
+```
+
+**Analysis**:
+
+* From the first plot, the mean of error is not 0, as the red line, indicating the mean error of the real data has a quadratic shape instead of a stable line cross residuals = 0.
+* As expected, since the outcome variable is extremely right-skewed, the residuals are not normally distributed either. In our case, only 40% of the residuals values are overlapping the ideal normality line, which is under the acceptable rate for a medium to large dataset (acceptable rate = 70%)
+* Based on the residuals plot vs Fitted value, the residuals fan out when fitted value increases, suggesting the presence of heteroskedasticity
+* The Leverage plot suggests that there are several extreme influential values of predictors, while all other 3 plots suggest that extreme outliers are also presented in the original dataset, and without transforming any variable.
+
+Thus, in the next step, we will transform the outcome variable and remove the outliers and extreme influential values.
+
+### Test Statistic for Heteroskedasticity
+
+**1. Breusch-Pagan Test**
+
+```{r}
+library(lmtest)
+bptest(ols_raw, data = eco_join)
+```
+
+The Test statistic is significant, Thus, reject the NULL Hypothesis.
+
+**2. Brown-Forsythe Test**
+
+```{r}
+library(onewaytests)
+eco_join$night_mainland50 <- as.factor(eco_join$night_mainland > 50)
+bf.test(total_cost ~ night_mainland50, data = eco_join)
+```
+```{r}
+eco_join <- eco_join %>% 
+  dplyr::select(-night_mainland50)
+```
+
+Test is significant, thus, we can reject NULL Hypothesis and conclude that heteroskedasticity is presented.
+
+
+## Data Pre-processing
+
+### Tranform Outcome Variable
+
+```{r}
+eco_join <- eco_join %>% 
+  mutate(ln_total_cost = log(total_cost))
+```
+
+Check the relationship between transformed outcome and predictors again:
+
+```{r}
+#library(tidyverse)
+eco_num2 <- eco_join %>% 
+  dplyr::select(ln_total_cost, total_female, total_male, night_mainland, night_zanzibar, distancetoTanzania) %>% 
+  drop_na()
+
+# Correlogram
+pairs(eco_num2, main = "Correlogram of Log Y and Quantitaive Predictors")
+
+# Correlation Matrix
+eco_corr2 <- cor(eco_num2)
+corrplot::corrplot(eco_corr2, order = "hclust", method = "number")
+```
+
+ANOVA Test for categorical variables:
+
+```{r}
+# Boxplot
+boxplot(ln_total_cost~age, data = eco_join)
+boxplot(ln_total_cost~travel_with, data = eco_join)
+boxplot(ln_total_cost~purpose, data = eco_join)
+boxplot(ln_total_cost~main_activity, data = eco_join)
+boxplot(ln_total_cost~info_source, data = eco_join)
+boxplot(ln_total_cost~package_transport_int, data = eco_join)
+boxplot(ln_total_cost~package_transport_tz, data = eco_join)
+boxplot(ln_total_cost~package_accomodation, data = eco_join)
+boxplot(ln_total_cost~package_food, data = eco_join)
+boxplot(ln_total_cost~package_sightseeing, data = eco_join)
+boxplot(ln_total_cost~package_guided_tour, data = eco_join)
+boxplot(ln_total_cost~package_insurance, data = eco_join)
+boxplot(ln_total_cost~payment_mode, data = eco_join)
+boxplot(ln_total_cost~first_trip_tz, data = eco_join)
+boxplot(ln_total_cost~by_tour, data = eco_join)
+```
+
+
+```{r}
+# ANOVA tests
+summary(aov(ln_total_cost~age, eco_join))
+summary(aov(ln_total_cost~travel_with, eco_join))
+summary(aov(ln_total_cost~purpose, eco_join))
+summary(aov(ln_total_cost~main_activity, eco_join))
+summary(aov(ln_total_cost~info_source, eco_join))
+summary(aov(ln_total_cost~package_transport_int, eco_join))
+summary(aov(ln_total_cost~package_transport_tz, eco_join))
+summary(aov(ln_total_cost~package_accomodation, eco_join))
+summary(aov(ln_total_cost~package_food, eco_join))
+summary(aov(ln_total_cost~package_sightseeing, eco_join))
+summary(aov(ln_total_cost~package_guided_tour, eco_join))
+summary(aov(ln_total_cost~package_insurance, eco_join))
+summary(aov(ln_total_cost~payment_mode, eco_join))
+summary(aov(ln_total_cost~first_trip_tz, eco_join))
+summary(aov(ln_total_cost~by_tour, eco_join))
+```
+
+Fit an OLS model using the transformed outcome variable
+
+```{r}
+log_ols <- lm(ln_total_cost~.-total_cost,
+              data = eco_join)
+summary(log_ols)
+plot(log_ols)
+```
+
+
+### Removing Outliers
+
+Since our raw data contains several outliers and extreme influential values, which affect our model unreliable with misleading test and analysis. Thus, we will remove the outliers and extreme values as the first step of data pre-processing.
+
+**1. Removing Outliers**
+
+We will use studentinized residuals method to verify the outliers based on residuals gained from the `ols_raw` model using full variables above.
+
+```{r}
+log_olsout <- augment(log_ols)
+log_olsout
+```
+
+```{r}
+.std.del.res <- rstudent(log_ols)
+
+resid_log <- log_olsout %>% 
+  cbind(.std.del.res) %>% 
+  mutate(.std.del.res1 = abs(.std.del.res)) %>% 
+  arrange(desc(.std.del.res1)) %>% 
+  dplyr::select(.std.del.res1, .std.del.res, everything())
+resid_log
+```
+
+Formal Test for Outliers
+
+Using the Benferroni test, we can calculate the true confident level for stimulating all variables at the same time. Here, we apply the default confidence level of 95% or alpha = 0.05.
+
+```{r}
+benf.alpha <- 1 - 0.05/(2*20)
+benf.alpha
+```
+
+The degree of freedom is n-p-1 = 4806 - 20 -1 = 4785.
+
+Student t Distribution is:
+
+```{r}
+st.thresh <- qt(benf.alpha, 4785)
+st.thresh
+```
+
+Check the outliers based on the studentinized residuals values against the threshold of 3.025
+
+```{r}
+resid_log %>% 
+  filter(.std.del.res1 > st.thresh)
+```
+
+Comparing each studentinized residual against the studentinized threshold of 3.025 we yield 101 outliers values. Thus, we will exlcude these values and check the data again if there's any redflags of those nearly that threshold.
+
+```{r}
+resid_log <- resid_log %>% 
+  filter(.std.del.res1 < st.thresh)
+```
+
+Checking through the .std.del.res, we could see that there are at least 100 values more with the studentinized residuals values less than 3.025 but but far away from this threshold. Thus, we will further investigate them below:
+
+```{r}
+library(olsrr)
+ols_plot_resid_stud_fit(log_ols)
+```
+
+Following the studentinized residuals method, we will remove all observations that have the absolute values of studentinized residuals being equal or more than 2. 
+
+```{r}
+resid_col <- resid_log %>% 
+  filter(.std.del.res1 < 2)
+head(resid_col)
+```
+
+### Select Model Specifications
+
+Get new data after removing the outliers:
+
+```{r}
+resid_col %>% 
+  dplyr::select(-c(.sigma, .cooksd, .std.resid, .std.del.res, .std.del.res1, .rownames, .fitted, .resid, .hat)) -> new_eco
+```
+
+Check the relationship between transformed outcome and predictors again:
+
+```{r}
+eco_num2 <- new_eco %>% 
+  dplyr::select(ln_total_cost, total_female, total_male, night_mainland, night_zanzibar, distancetoTanzania) %>% 
+  drop_na()
+
+# Correlogram
+pairs(eco_num2, main = "Correlogram of Log Y and Quantitaive Predictors")
+
+# Correlation Matrix
+eco_corr2 <- cor(eco_num2)
+corrplot::corrplot(eco_corr2, order = "hclust", method = "number")
+```
+
+ANOVA Test for categorical variables:
+
+```{r}
+# Boxplot
+boxplot(ln_total_cost~age, data = eco_join)
+boxplot(ln_total_cost~travel_with, data = eco_join)
+boxplot(ln_total_cost~purpose, data = eco_join)
+boxplot(ln_total_cost~main_activity, data = eco_join)
+boxplot(ln_total_cost~info_source, data = eco_join)
+boxplot(ln_total_cost~package_transport_int, data = eco_join)
+boxplot(ln_total_cost~package_transport_tz, data = eco_join)
+boxplot(ln_total_cost~package_accomodation, data = eco_join)
+boxplot(ln_total_cost~package_food, data = eco_join)
+boxplot(ln_total_cost~package_sightseeing, data = eco_join)
+boxplot(ln_total_cost~package_guided_tour, data = eco_join)
+boxplot(ln_total_cost~package_insurance, data = eco_join)
+boxplot(ln_total_cost~payment_mode, data = eco_join)
+boxplot(ln_total_cost~first_trip_tz, data = eco_join)
+boxplot(ln_total_cost~by_tour, data = eco_join)
+```
+
+
+```{r}
+# ANOVA tests
+summary(aov(total_cost~age, eco_join))
+summary(aov(total_cost~travel_with, eco_join))
+summary(aov(total_cost~purpose, eco_join))
+summary(aov(total_cost~main_activity, eco_join))
+summary(aov(total_cost~info_source, eco_join))
+summary(aov(total_cost~package_transport_int, eco_join))
+summary(aov(total_cost~package_transport_tz, eco_join))
+summary(aov(total_cost~package_accomodation, eco_join))
+summary(aov(total_cost~package_food, eco_join))
+summary(aov(total_cost~package_sightseeing, eco_join))
+summary(aov(total_cost~package_guided_tour, eco_join))
+summary(aov(total_cost~package_insurance, eco_join))
+summary(aov(total_cost~payment_mode, eco_join))
+summary(aov(total_cost~first_trip_tz, eco_join))
+summary(aov(total_cost~by_tour, eco_join))
+```
+
+
+
+```{r}
+mod1 <- lm(ln_total_cost~.-total_cost,
+           data = new_eco)
+summary(mod1)
+plot(mod1)
+```
+**ANOVA Anlysis**
+
+```{r}
+library(lbutils)
+lb_anovat_lm(mod1, reg_collapse = FALSE)
+```
+
+The ANOVA table shows that **package_guided_tour**, **package_insurance**, and **first_trip_tz** are insignificant in the original full model.
+
+```{r}
+library(car)
+library(klaR)
+
+cond.index(mod1, data = new_eco)
+vif(mod1)
+```
+
+**Analysis**
+
+* Condition Index indicates the level of multicollinearity for the whole model, with the range given below:
+
+  - If CI < 30 : multicollinearity is tolerable at model level
+  - If 30 <= CI < 50: required considerations and further examination to determine if multicollinearity is tolerable
+  - If CI >= 50: severe multicollinearity
+
+In our case, the largest Condition Index is 26.8 which is lower than the first threshold of CI = 30, thus, the model level, `mod1` does not suffer from multicollinearity. However, we still need to check the multicollinearity contributions at the variable level.
+
+* In general, if any associated variable has the VIF > 10, the model has severe multicollinearity. In our case, the full model `mod1` returns that **by_tour** and **package_accomodation** has VIF > 10, while **purpose** and **main_activity**, **package_transport**, **package_sightseeing**, **package_guided_tour** also hold high VIF > 3. Thus, we conclude that these are variables that contributes to the multicollinearity in `mod1`. Such result is expected and aligned with our Preliminary Analysis above that the each tour package element shall not stand independently and significantly explain the outcome total costs of the trip.
+
+**Variable Selection**
+
+We will use stepwise method to select the variables for model specifications. The stepwise method will compare the significant level of explained proportion of each predictors toward the outcome variable, with upper limit of full model and lower limit of NULL model. Stepwise process is a combination of step-backward from full model and step-forward from NULL model. The process will remove the least significant variable then fit the model again, then put back one of the removed variable to test if there's any changes in its significant. This loop of process will be implemented until when there is no more insignificant variable to be removed.
+
+```{r}
+mod_null <- lm(ln_total_cost~1,
+               data = new_eco)
+
+mod_step <- step(mod1, 
+                 scope = list(lower = mod_null, 
+                              upper = mod1), 
+                 direction = "both", 
+                 test = "F")
+
+summary(mod_step)
+```
+
+**Analysis**
+
+Based on the stepwise process, we gain a model that has been removed information source and tour package elements. While there is 1 more variable **first_trip_tz** being significant at the magnitude of p-value = 0.12, we will remove this variable and fit the model again.
+
+```{r}
+mod2 <- lm(ln_total_cost~travel_with + total_female + total_male + 
+    purpose + main_activity + package_transport_int + package_food + 
+    package_transport_tz + night_mainland + night_zanzibar + 
+    payment_mode + age + by_tour + distancetoTanzania,
+    data = new_eco)
+summary(mod2)
+```
+
+```{r}
+plot(mod2)
+```
+
+
+Let's the multicollinearity level in this new model
+
+```{r}
+cond.index(mod2, data = new_eco)
+vif(mod2)
+```
+
+
+**Analysis**
+
+As the CI < 30 and all VIF < 10, the new model using 14 variables are multicollinearity tolerable. Nevertheless, in the Test Statistic section below, we will further examine the fit of these models, before concluding any model specifications for further analysis.
+
+## Intervals
+
+### Confidence Interval for Outcome
+
+```{r}
+head(predict(mod2, newdata = eco_join, interval = "confidence", level = 0.95), 10)
+```
+
+### Prediction Interval
+
+```{r}
+head(predict(mod2, newdata = eco_join, interval = "prediction", level = 0.95), 10)
+```
+
+### Bonferronie Method
+
+By using the bonferronie method, we take all variables simulously at the same time. Thus the true confidence level is
+
+$$
+1 - \frac{\alpha}{p} = 1 - \frac{0.05}{14} = 0.9964
+$$
+
+```{r}
+library(broom)
+tidy(mod2, conf.int = "TRUE", conf.level = (1-0.05/14))
+```
+
+
+## Test Statistics
+
+### Test if age is a significant predictor variable
+
+As one of our analytics question is to discover if Gen X people are willing to spend more on travelling than other generations, we will test if **age** is a significant in our reduced model.
+
+* $H_0$: $\beta_{age} = 0$
+* $H_a$: $\beta_{age} \neq 0$
+
+Test Statistic: Since the test statistic has already been included in the outcome of our model, we use the tidy() function to pull it out
+
+```{r}
+out1 <- tidy(mod2)
+out1 %>% 
+  filter(str_detect(out1$term, "^age\\w+") == TRUE)
+```
+
+
+Conclusion:
+
+
+### Test models' Goodness of Fit
+
+Compared to the full model `mod1`, the reduced model `mod2` only include 14 variables to predict the outcome of ln_total_cost. Thus, we will compare these 2 models based on 3 criteria:
+
+* Adjusted R-squared
+* AIC and BIC
+* F-test on the Goodness of Fit
+
+**1. Adjusted R-squared**
+
+The Adjusted R-squared of `mod1` is 0.674 or 67.4%, which is 0.04% higher than the Adjusted R-squared from the reduced model `mod2`. While adding more variables to a model, we will yield more statistical explanatory power. However, in this case, while removing 6 predictor variables from the full model, we still gain a good result (just a very slightly difference) of the explained variability of outcome.
+
+Following the Principle of Parsimony, we prefer the simpler model but still doing a good jobs in explaining our data. Thus, we choose the reduced model `mod2`.
+
+**2. AIC and BIC**
+
+```{r}
+bind_rows(glance(mod1), glance(mod2)) %>% 
+  mutate(models = c("mod1", "mod2")) %>% 
+  dplyr::select(models, AIC, BIC, everything())
+```
+
+Both AIC and BIC of the reduced model `mod2` are lower than those of the full model `mod1`. Thus, we prefer `mod2` over `mod1`.
+
+**3. F-test on the Goodness of Fit**
+
+* $H_0$: $\beta_{info} = \beta_{fist_trip} = \beta_{accomodation} = \beta_{sightseeing} = \beta_{tour} = \beta_{insurance} = 0$
+* $H_a$: At least one of $\beta_i \neq 0$
+
+```{r}
+# Fit model 1 again with the variable sequence similar to model 2
+mod1 <- lm(ln_total_cost ~ travel_with + total_female + total_male + purpose + 
+    main_activity + package_transport_int + package_food + package_transport_tz + 
+    night_mainland + night_zanzibar + payment_mode + age + by_tour + 
+    distancetoTanzania + info_source + first_trip_tz + package_accomodation + 
+      package_sightseeing + package_guided_tour + package_insurance,
+    data = new_eco)
+lb_anovat_lm(mod1, reg_collapse = FALSE)
+
+# Quick Compare between 2 models
+anova(mod2, mod1)
+```
+
+**Notation for Test Result**: Model 1 = `mod2` or the reduced model; Model 2 = `mod1` or the full model
+
+**Conclusion:**
+
+Based on the ANOVA Breakdown table, the associated p-values of 6 additional variables in `mod1` are higher than the default $\alpha = 0.05$. Thus, there is insufficient evidence for us to reject the NULL Hypothesis that thee are insignificant variables to predict the outcome of **ln_total_cost**.
+
+In addition, based on the quick F-test ANOVA between 2 models, the test yields a p-value of 0.1011, implying that making the model more complicated with these mentioned 6 variables does not contribute to improve the Goodness of Fit for the model.
+
+Therefore, given the F-test, `mod2` is superior than `mod1`
+
+Again, all of the 3 criteria support that `mod2` is better than `mod1`. Furthermore, as we examinize the multicollinearity issues, the issue is tolerable in `mod2`, while it is severe in `mod1`. Thus. `mod2` is our better choice.
+
+## Specification Selections
+
+* As the reduced model is more superior than the full model, we will use the reduced specification to train and test model for our predictive accuracy purpose.
+
+* Nevertheless, while none of the VIF of all variables in this specification are not over the threshold of 10, many of them are still larger than 3.0, such as: by_tour, package_food, purpose, main_activity, and package_transport_tz. Thus, we will also use other robust regression methods, Ridge and PCR, to fit our data.
+
+* Upon fitting these 3 regression models, i.e.: Ordinary Least Square, Ridge, and PCR, we will conduct cross-validation to get the model with the most optimal outcome.
+
+# Model Training & Testing
+
+## Ordinary Least Square Regression
+
+We will apply the 10-fold cross-validation method, which will further split the train data into 10 smaller subsets. Everytime we run an OLS model, the model will take 9 out of 10 folds to compute our model, while using another 1 fold to test our model. This loop will be repeated until all data points are being tested. This model building method will allow us to build and validate a model at the same time, and thus, extract the best model for further cross-validation.
+
+```{r}
+# 10FCV on the whole set
+RNGkind(sample.kind = "default")
+library(caret)
+set.seed(1)
+train_mod <- train(ln_total_cost~travel_with + total_female + total_male + 
+    purpose + main_activity + package_transport_int + package_food + 
+    package_transport_tz + night_mainland + night_zanzibar + 
+    payment_mode + age + by_tour + distancetoTanzania,
+    data = new_eco,
+    method = "lm",
+    trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE))
+
+summary(train_mod)
+```
+
+* $R^2 = 0.6755$ or 67.55% - This model can explain 67.55% of the variability of outcome **ln_total_cost**.
+
+Calculating MSE and RMSE:
+
+```{r}
+train_mod$results
+```
+
+
+```{r}
+train_mod$results
+RMSE <- train_mod$results[,2]
+MSE <- RMSE^2
+cbind("OLS MSE" = MSE, "OLS RMSE" = RMSE)
+```
+
+* **Model Interpretation**: (Refer to the report) On the average, while keeping every other variables constant, we observe the following effects of predictors on the outcome:
+
+  - The effects of **Age** are significant.
+  - People who traveled with Family and Friends/Relatives tend to 
+  - If there is one more male traveling, the costs will increase by 
+
+
+## Ridge Regression
+
+### Data Preparation
+
+Create a matrix of predictor variables and outcome variable
+
+```{r}
+x_train <- model.matrix(ln_total_cost ~ travel_with + total_female + total_male + 
+    purpose + main_activity + package_transport_int + package_food + 
+    package_transport_tz + night_mainland + night_zanzibar + 
+    payment_mode + age + by_tour + distancetoTanzania, 
+                  data = new_eco)[,-1]
+
+y_train <- new_eco$ln_total_cost
+```
+
+### Fit Ridge Regression on the train set
+
+First, let's fit a Ridge Regression model using the random split train set above:
+
+```{r}
+library(glmnet)
+ridge_mod <- glmnet(x_train, y_train, alpha = 0) # alpha = 0 --> Ridge, else, LASSO
+plot(ridge_mod)
+```
+
+Now apply the 10-FCV cross-validation method on Ridge Regression. We will extract the regression coefficient of the model with the best $\lambda$ value, thus, calculating the corresponding MSE and RMSE to compare with other models.
+
+```{r}
+set.seed(1)
+
+ridge.cv <- cv.glmnet(x_train, y_train, alpha = 0)
+plot(ridge.cv)
+
+# Best Lambda for Ridge Regression
+best_lambda <- ridge.cv$lambda.min
+min_error <- min(ridge.cv$cvm)
+cbind(
+  "Best Ridge Lambda" = best_lambda,
+  "Best Ridge MSE" = min_error,
+  "Best Ridge RMSE" = sqrt(min_error)
+)
+
+# Extract coefficient of the best lambda model
+coef(ridge_mod, s = best_lambda)
+```
+
+
+
+* **Model Interpretation**: on the average, while keeping every other variables constant, we observe the following effects of predictors on the outcome:
+
+  - The effects of **Age** are significant. 
+  - People who traveled with Family and Friends/Relatives tend to spend 
+  - Pretty similar to the effect of having one more male or female travelers in the OLS Regression model, in Ridge model, the total costs also increase...
+  
+* While the regression coefficient effects of Ridge Regression are somewhat similar to those of the OLS Regression model above, there are differences due to the tuning parameter - shrinkage lambda applied. Acknowledging that when the shrinkage lambda is 0, Ridge regression model will be the same as the plain OLS Regression model. Thus, in this case, we can conclude that the best lambda value is pretty small (best lambda = 0.105) that does not create much differences in the coefficients.
+
+  
+
+## PCR 
+
+While Ridge Regression overcomes the multicollinearity issue by shrinking the coefficients to minimize the effects of multicollinearity, PCR method overcomes the issue by using components instead of variables, thus, totally remove any collinearity from the model.
+
+**Fitting PCR Model**
+
+```{r}
+library(pls)
+
+pcr_mod <- pcr(ln_total_cost~travel_with + total_female + total_male + 
+    purpose + main_activity + package_transport_int + package_food + 
+    package_transport_tz + night_mainland + night_zanzibar + 
+    payment_mode + age + by_tour + distancetoTanzania, 
+               data = new_eco, scale=T, validation = "CV")
+validationplot(pcr_mod, val.type = "RMSEP")
+summary(pcr_mod)
+```
+
+**Model-Component Selections** 
+
+Based on the SCREE plot, we can see that there are a clear elbow at `component = 1`, a good elbow at `component = 5`, and some faint elbows at `component = 10 or 16`. Nevertheless, we will assess 3 criteria to select the best number of components for our model.
+
+* **RMSE**: PCR model yields the best RMSE value of 0.9223 when the number of components is 27.
+* **% explained variance of the predictors**: In general, the proportion of explained variance of the predictors will increase as we add more components to the model. Nevertheless, a proportion of 70% is the acceptable threshold. Out of all 27 levels of components, the model with 27 components yield the highest proportionality of 100%, while models with at least 12 components have the acceptable range of % explained variance of predictors.
+* **% explained variance of outcome variable**: Out of all, the model with 27 components yields the highest proportion of explained variance of the outcome (67.55%). This is equivalent with the R-squared value in OLS model. 
+
+Since the proportionality of explained variance in predictors and outcome variable increase steadily as the number of components increases, we would take the range of components from 12 to 27 to consider model-component selection accordingly to our goals. If the goal is about dimensionality reduction and less focus on prediction, we will choose the model with 12 components (following the Principle of Parsimony). If our goal is prediction accuracy, we will select model with the smallest value of RMSE - model with 27 components.
+
+**Regression Coefficients Analysis**
+
+Let's pull out the coefficients of the models with 12 and 27 components for our regression coefficients analysis. We observe that the coefficients of PCR model are far different from Ridge or OLS Regression models - none of the coefficients went over 1. In addition, there is no y-intercept included in the regression coefficient list. As mentioned above, PCR uses different approach to build regression model, using components instead of variables. Thus, even though we can pull out the regression coefficients output, the model does not support interpretation goal as much as Ridge or OLS Regression does.
+
+Nevertheless, we can still interpret these coefficients.
+
+```{r}
+pcr_mod$coefficients[,,c(12, 27)]
+```
+
+
+## Final Model Selections
+
+**If analytics goal is interpretation or inference**, we can choose OLS Regression model or any Ridge Regression model with acceptable small shrinkage lambda.
+
+**If analytics goal is prediction accuracy**, we will select the model with the smallest RMSE. Based on the combined result below, the RMSE values are just very slightly different across 3 regression models: Best OLS Regression, Best Ridge Regression, and PCR with 27 components. Out of all, Best Ridge Regression returns the lowest value of RMSE (0.9219), thus, we will choose Best Ridge Regression as our final model for prediction accuracy.
+
+```{r}
+cbind(
+  "Best Ridge RMSE" = sqrt(min_error),
+  "Best OLS RMSE" = RMSE,
+  "Best PCR RMSE" = 0.9223)
+```
+
