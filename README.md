@@ -6,7 +6,7 @@
 
 **Emails:** bn6523a@student.american.edu (Binh Minh An Nguyen); cm0789a@student.american.edu (Concillia Mpofu)
 
-GitHub IDs: annguyenbm (Binh Minh An Nguyen)
+GitHub IDs: annguyenbm (Binh Minh An Nguyen), ConcilliaHlezi (Concillia Mpofu)
 
 ## Purpose & Motivation
 
